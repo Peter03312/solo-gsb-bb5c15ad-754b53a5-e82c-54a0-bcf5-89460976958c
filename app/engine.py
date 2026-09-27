@@ -1,12 +1,21 @@
 """核心模拟引擎：在单个 IMMEDIATE 事务中完成匹配、渲染、状态推进。
 
+渲染完成后、提交之前还会做一次**与真实 HTTP 响应一致的编码检查**
+（``_assert_response_encodable``，真实请求与全部预演共用同一份规划代码）：
+场景响应头与 ``X-Sim-*`` 调试头必须能按 Latin-1 编码，JSON 响应体必须能以
+``allow_nan=False`` 序列化（不得含 NaN/Infinity）。失败统一抛
+``500 invalid_response`` 且**整次请求随事务回滚**——不推进状态、不消耗
+seq/随机序列、不写会话（懒创建的会话也不留下）、事件或幂等记录；用同一
+``sim-idempotency-key`` 修正输入后即可正常执行。检查只读已渲染结果，不二次
+渲染、不额外消耗序列；有效响应及其幂等回放内容保持不变。
+
 同一会话快照还支持**预演**（``preview_session`` / ``preview_chain``）：在只读
-事务中复用路由匹配、条件判定与模板渲染的同一份代码。单次预演产出拟响应与
-state/context 差异；请求链预演（``preview_chain``）从同一快照出发依次执行
-有序请求，后一步看到前一步拟产生的 state/context/seq/随机序列变化，任一匹配
-或渲染失败即停止。两种预演全程回滚、不写任何表；即使模板调用 ``seq()`` 或
-会话级随机函数，计数与随机状态也只在一次性的渲染器实例内推进，随后的真实
-请求仍看到预演前的值。
+事务中复用路由匹配、条件判定、模板渲染与上述编码检查的同一份代码。单次预演
+产出拟响应与 state/context 差异；请求链预演（``preview_chain``）从同一快照
+出发依次执行有序请求，后一步看到前一步拟产生的 state/context/seq/随机序列
+变化，任一匹配、渲染或响应编码失败即停止并保留此前拟结果。两种预演全程
+回滚、不写任何表；即使模板调用 ``seq()`` 或会话级随机函数，计数与随机状态
+也只在一次性的渲染器实例内推进，随后的真实请求仍看到预演前的值。
 
 此外提供**版本回归对比**（``compare_revisions``）：两个 scenario revision
 各自从其 ``initial_state`` 建立完全独立的纯内存快照（``_CompareSide``，时钟
@@ -34,6 +43,7 @@ seq 计数或随机状态。
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 from dataclasses import dataclass
 from typing import Any
@@ -168,9 +178,11 @@ def _condition_trace(cond, bag: dict[str, Any]) -> dict[str, Any]:
         "source": cond.source,
         "path": cond.path,
         "op": cond.op,
-        "expected": cond.value,
+        # 轨迹仅用于对外展示：actual/expected 可能取自含 NaN/Infinity 的
+        # 请求体，需保证可 JSON 编码（判定仍基于原始值，不受清洗影响）
+        "expected": _json_clean(cond.value),
         "present": present,
-        "actual": actual,
+        "actual": _json_clean(actual),
         "passed": passed,
         **({"error": error} if error else {}),
     }
@@ -242,6 +254,88 @@ def _render_response(rule: Rule, renderer: Renderer) -> tuple[int, dict[str, str
     return status, headers, body, is_json
 
 
+# ---------------------------------------------------------------------------
+# 拟响应编码检查：与真实 HTTP 响应（Starlette 序列化）完全一致，
+# 提交前完成；只读已渲染结果，不二次渲染、不额外消耗 seq/随机序列。
+# ---------------------------------------------------------------------------
+
+def _json_clean(value: Any) -> Any:
+    """把任意渲染值转成保证可 JSON 编码的形态（仅用于轨迹/错误展示）。
+
+    NaN/Infinity 转为其 Python 文本（``"NaN"``/``"Infinity"``/``"-Infinity"``），
+    其余不可 JSON 序列化的值转为 ``repr`` 字符串，dict/list 递归处理；
+    不改动参与匹配判定的原始值，只影响对外展示的轨迹。
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return value
+    if isinstance(value, float):
+        if math.isnan(value):
+            return "NaN"
+        if math.isinf(value):
+            return "Infinity" if value > 0 else "-Infinity"
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_clean(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_clean(v) for v in value]
+    try:
+        json.dumps(value)
+    except (TypeError, ValueError):
+        return repr(value)
+    return value
+
+
+def _assert_response_encodable(*, scenario_name: str, route_id: str, rule_name: str,
+                               from_state: str, to_state: str,
+                               headers: dict[str, str], body: Any, is_json: bool,
+                               trace: list[dict[str, Any]]) -> None:
+    """对拟响应做与真实 HTTP 响应一致的编码检查（提交前完成）。
+
+    真实响应由 Starlette 序列化（见 ``main._build_response``）：
+
+    - 全部响应头按 Latin-1 编码（``k.lower().encode('latin-1')`` 与
+      ``v.encode('latin-1')``）——除场景声明的响应头外，还包括这里同规则
+      追加的 ``X-Sim-Matched``（场景:路由:规则）与 ``X-Sim-State``（from->to）
+      调试头（``X-Sim-Revision`` 恒为数字，不可能失败）；
+    - JSON 响应体按 ``json.dumps(..., ensure_ascii=False, allow_nan=False)``
+      编码：含 ``NaN``/``Infinity`` 或不可序列化值即失败。
+
+    任一失败抛 :class:`SimAbort` 500 ``invalid_response``：真实请求随写事务
+    整体回滚（不写会话/事件/幂等记录，懒创建会话也不留下），单次与链式
+    预演复用同一检查（链在失败步停止、此前拟结果保留、不落库）。
+    错误体只含字符串信息（绝不嵌入可能再次无法编码的响应体原值），保证
+    自身可正常 JSON 编码。
+    """
+    outgoing: list[tuple[str, str]] = [
+        (str(name), str(value)) for name, value in headers.items()
+    ] + [
+        ("X-Sim-Matched", f"{scenario_name}:{route_id}:{rule_name}"),
+        ("X-Sim-State", f"{from_state}->{to_state}"),
+    ]
+    for name, value in outgoing:
+        try:
+            name.lower().encode("latin-1")
+            value.encode("latin-1")
+        except UnicodeEncodeError as exc:
+            raise SimAbort(500, {
+                "error": "invalid_response",
+                "rule": rule_name,
+                "detail": f"响应头 {name!r} 的名称或值无法按 Latin-1 编码，"
+                          f"真实 HTTP 响应无法序列化: {exc}",
+            }, trace=trace) from exc
+
+    if is_json and body is not None:
+        try:
+            json.dumps(body, ensure_ascii=False, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise SimAbort(500, {
+                "error": "invalid_response",
+                "rule": rule_name,
+                "detail": "JSON 响应体无法编码：包含 NaN/Infinity 或不可 JSON "
+                          f"序列化的值（已在提交前拦截）: {exc}",
+            }, trace=trace) from exc
+
+
 @dataclass
 class _Planned:
     """命中规则后的渲染结果与拟推进状态——尚未持久化。"""
@@ -300,6 +394,14 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
         raise SimAbort(500, {"error": "render_error",
                              "rule": rule.name, "detail": str(exc)},
                         trace=trace) from exc
+
+    # 编码检查在提交前完成（与真实 HTTP 响应一致）：失败即让整次请求回滚，
+    # 不推进状态/seq/随机序列，不写会话、事件或幂等记录；只读已渲染结果，
+    # 不会二次渲染或额外消耗序列。真实请求、单次/链式预演与版本对比共用此检查。
+    _assert_response_encodable(
+        scenario_name=scenario_name, route_id=route.id, rule_name=rule.name,
+        from_state=state, to_state=next_state,
+        headers=resp_headers, body=resp_body, is_json=is_json, trace=trace)
 
     if not isinstance(updates, dict):
         raise SimAbort(500, {"error": "render_error",
@@ -1144,7 +1246,8 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
                     method=req["method"], path=req["path"],
                     query=req["query"], headers=req["headers"], body=req["body"])
             except SimAbort as exc:
-                # 路由、规则或渲染失败：立即停止，仅返回此前成功步骤
+                # 路由、规则或渲染失败（含 500 invalid_response）：立即停止，
+                # 仅返回此前成功步骤
                 failed_index = index
                 error_body = dict(exc.body)
                 if exc.trace is not None:
@@ -1153,10 +1256,13 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
                     "index": index,
                     "kind": _failure_kind(exc.status_code),
                     "status_code": exc.status_code,
+                    # 回显的请求体可能本身含 NaN/Infinity（JSON 允许的字面量），
+                    # 清洗后再放入错误信封，保证失败响应整体可 JSON 编码
                     "request": {
                         "method": req["method"], "path": req["path"],
-                        "query": req["query"], "headers": req["headers"],
-                        "body": req["body"],
+                        "query": _json_clean(req["query"]),
+                        "headers": _json_clean(req["headers"]),
+                        "body": _json_clean(req["body"]),
                     },
                     "error": error_body,
                 }

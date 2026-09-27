@@ -76,7 +76,11 @@ SQLite 写事务**中落库；同一 token/key 且指纹相同的重试直接返
 docker compose up --build -d
 ```
 
-服务地址：<http://localhost:8080>
+这一条命令即完成**依赖安装**（镜像构建时 `pip install -r requirements.txt`）、
+**数据库初始化**（启动时建表并对旧库就地升级）与示例场景自动加载，无需任何
+额外步骤；下方配置项均有默认值，不改也能直接跑。
+
+服务地址：<http://localhost:8080>（端口可用 `SIM_PORT` 修改，见「配置」）
 
 | 用途 | 地址 |
 | --- | --- |
@@ -257,6 +261,11 @@ states:
 - 过滤器：Jinja2 标准过滤器（如 `body.x | default('v')`）。
 - 响应体 `body` 为 dict/list 时按 JSON 返回；为字符串时配合 `Content-Type` 头
   可返回 HTML/纯文本等。
+- **响应编码约束（与真实 HTTP 响应一致）**：响应头（含模板渲染结果与
+  `X-Sim-Matched`/`X-Sim-State` 调试头）必须能按 **Latin-1** 编码——模板产生
+  中文等超出 Latin-1 的值会失败；JSON 响应体不得含 `NaN`/`Infinity`（文本
+  响应体不受限，按 UTF-8 发送）。违反时在**提交前**统一返回
+  `500 invalid_response` 并整体回滚，详见下文「响应编码检查」。
 
 ### 校验规则
 
@@ -827,7 +836,7 @@ curl -s -X POST $BASE/__sessions/lc/advance -H 'Content-Type: application/json' 
   本步抽样前后步数，真实序列保持不变；
 - 命中时 HTTP 状态码为 `200`，拟返回的状态码在 `response.status_code` 中；
   未命中时直接返回**与真实请求一致的状态码与错误详情**（404 / 405 / 409 /
-  500 等），并附带逐条件判定轨迹 `trace`；
+  500 `render_error` / 500 `invalid_response` 等），并附带逐条件判定轨迹 `trace`；
 - 预演要求会话**已存在**（不会懒创建）；会话不存在返回 404。
 
 请求体字段：
@@ -912,7 +921,8 @@ curl -s -X POST $BASE/__sessions/t1/preview \
   `state_diff` / `context_diff` / `seq_preview` / `rng` / `trace`；
 - 拟响应为错误状态码但**确实命中了规则**（如 400/409 兜底规则）属于正常
   模拟响应，链路继续；只有**路由失败**（404/405）、**无规则命中**（409
-  `no_matching_rule`）或**渲染失败**（500 `render_error`）才会立即停止，
+  `no_matching_rule`）、**渲染失败**（500 `render_error`）或**响应编码失败**
+  （500 `invalid_response`）才会立即停止，
   返回 `failed_index`、失败类型 `failure.kind`（`route`/`rule`/`render`）、
   失败请求与错误体（含 `trace`），以及此前已成功的各步；
 - 全程在只读事务中执行并最终回滚：**不写 sessions、不写 events、不推进序列
@@ -1016,7 +1026,8 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
   （方法、路径、查询参数、请求体，以及场景 `when` 中 `source: header` 声明的
   匹配字段取值）与响应（状态码、响应头、响应体）随状态迁移、事件在**同一个
   SQLite 写事务**中保存；未命中规则（409 `no_matching_rule`）、路由不存在
-  （404）或渲染失败（500）都不留记录，修正后用同一 key 重试仍会真正执行；
+  （404）、渲染失败（500 `render_error`）或响应编码失败
+  （500 `invalid_response`）都不留记录，修正后用同一 key 重试仍会真正执行；
 - **相同指纹重试 = 回放**：同 token/key 且指纹相同的后续请求直接返回首个
   响应（含 `X-Sim-Matched`/`X-Sim-State` 等调试头，另加
   `X-Sim-Idempotent-Replay: true`），**不再渲染模板、不推进状态、不消耗
@@ -1051,6 +1062,54 @@ curl -s -X POST $BASE/orders \
 # 4) 重置会话后该 token 的幂等记录被清除，同一 key 可重新使用
 curl -s -X POST $BASE/__sessions/t1/reset \
   -H 'Content-Type: application/json' -d '{}'
+```
+
+#### 响应编码检查（invalid_response）
+
+模板渲染产出的拟响应要能被真实 HTTP 服务序列化：响应头按 **Latin-1** 编码，
+JSON 响应体不得含 `NaN`/`Infinity`（且必须可 JSON 序列化）。与真实响应一致
+的编码检查在**共享执行规划阶段、写事务提交之前**完成（真实请求、单次预演、
+链式预演与版本回归对比复用同一检查），两类失败会被提前拦截：
+
+- 响应头模板产生无法按 Latin-1 编码的值（如 `X-Note: "{{ body.note }}"`
+  渲染出中文）；同理，场景的规则名/状态名含非 Latin-1 字符时，
+  `X-Sim-Matched`/`X-Sim-State` 调试头也无法编码；
+- JSON 响应含 `NaN`/`Infinity`（如 `v: "{{ body.v }}"` 回显了请求中的
+  `NaN`，或显式声明 JSON `Content-Type` 的裸 `NaN` 值）。
+
+失败时**统一返回 `500 invalid_response`**（错误体只含文本说明，自身保证可
+JSON 编码），并且**整次请求随事务原子回滚**：
+
+- **不推进**状态、`seq()` 计数与 seed 随机序列（修正输入后重试仍取同一个
+  序列值，与「渲染失败不消耗」语义一致）；
+- **不写**会话、事件或幂等记录；**懒创建的会话也不留下**（之后查
+  `/__sessions/{token}` 仍是 404）；
+- 携带 `sim-idempotency-key` 的失败请求同样**不占用 key**：用**同一 key**
+  修正输入后重试会真正执行，不会得到 `409 idempotency_key_conflict`；
+- **检查只读已渲染结果，不会二次渲染或额外消耗序列**；有效响应与已有幂等
+  回放的内容完全保持不变。
+
+文本响应（非 JSON `Content-Type` 且 `body` 为字符串）按 UTF-8 发送，正文
+中的中文与 `nan` 文本不受影响；限制只针对响应头与 JSON 响应体。
+
+**预演同样复用此检查**：单次预演对无法编码的拟响应返回 500
+`invalid_response`（附 `trace`）；链式预演在失败步**立即停止**，保留此前各步
+的拟结果与拟最终快照，失败请求回显中的 `NaN`/`Infinity` 会清洗为
+`"NaN"`/`"Infinity"` 文本以保证信封可编码；预演全程只读回滚，不落库。
+
+```bash
+# 中文响应头：500 invalid_response；事务回滚，会话/事件/幂等均不留下
+curl -s -X POST $BASE/notes \
+  -H 'sim-session-token: t1' -H 'sim-idempotency-key: n1' \
+  -H 'Content-Type: application/json' \
+  -d '{"note":"中文备注"}'
+# -> {"error":"invalid_response","detail":"响应头 'X-Note' 的名称或值无法按
+#     Latin-1 编码，真实 HTTP 响应无法序列化: ..."}
+
+# 同一 key，修正为合法值后真正执行（而非 409）
+curl -s -X POST $BASE/notes \
+  -H 'sim-session-token: t1' -H 'sim-idempotency-key: n1' \
+  -H 'Content-Type: application/json' -d '{"note":"ok"}'
 ```
 
 ### 业务请求约定
@@ -1192,7 +1251,7 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 │   ├── models.py          # 场景/路由/规则/状态超时数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染、模板函数与会话级确定性随机源（seed）
-│   ├── engine.py          # 核心：单事务匹配→渲染→迁移；幂等回放（指纹+首响应随事务落库）；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比；会话批量版本迁移（单写事务校验+迁移）
+│   ├── engine.py          # 核心：单事务匹配→渲染→编码检查→迁移；响应提交前按 Latin-1/JSON(allow_nan=False) 拦截 invalid_response（真实/预演共用）；幂等回放（指纹+首响应随事务落库）；虚拟时钟 advance 超时连续结算；同快照只读预演（零副作用）；两 revision 纯内存版本回归对比；会话批量版本迁移（单写事务校验+迁移）
 │   ├── event_bus.py       # 进程内事件总线：写事务提交后唤醒 SSE 订阅者（单 worker 权威）
 │   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
